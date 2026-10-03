@@ -1,0 +1,20 @@
+{
+  "name": "ksbl-lost-found-server",
+  "version": "1.0.0",
+  "description": "REST API for the KSBL Lost & Found app",
+  "main": "index.js",
+  "private": true,
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js",
+    "seed": "node seed.js",
+    "test": "node --test --test-reporter=spec"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "better-sqlite3": "^13.0.3",
+    "cors": "^2.8.6",
+    "express": "^5.2.1",
+    "ksbl-lost-and-found": "file:.."
+  }
+}

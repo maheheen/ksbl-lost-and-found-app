@@ -1,0 +1,17 @@
+{
+  "name": "ksbl-lost-and-found",
+  "version": "1.0.0",
+  "private": true,
+  "description": "KSBL Lost & Found - React + Express + SQLite",
+  "scripts": {
+    "setup": "npm install && npm install --prefix server && npm install --prefix client",
+    "seed": "npm run seed --prefix server",
+    "dev": "concurrently -n api,web -c blue,magenta \"npm run dev --prefix server\" \"npm run dev --prefix client\"",
+    "test": "npm test --prefix server",
+    "build": "npm run build --prefix client",
+    "start": "npm start --prefix server"
+  },
+  "devDependencies": {
+    "concurrently": "^10.0.5"
+  }
+}

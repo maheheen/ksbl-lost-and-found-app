@@ -1,0 +1,6 @@
+node_modules/
+client/dist/
+server/lostfound.db
+server/lostfound.db-shm
+server/lostfound.db-wal
+.claude/
