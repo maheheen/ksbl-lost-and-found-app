@@ -1,5 +1,6 @@
 // Fills the database with realistic sample campus items:  npm run seed
 // WARNING: this clears the items table first, so run it on a fresh/demo database.
+// With TURSO_DATABASE_URL / TURSO_AUTH_TOKEN set it fills the hosted database instead of the local file.
 //
 // Dates are written as "days ago" so the demo always looks recent. What the data shows:
 //   - Lost "calculator", "keys", "backpack" and "ID card" each have 1-2 possible matches
@@ -56,30 +57,39 @@ const PAIRS = [
   ["umbrella-lost", "umbrella-found"],
 ];
 
-const db = openDb();
-const insert = db.prepare(`
-  INSERT INTO items (type, title, description, category, location, date, status)
-  VALUES (@type, @title, @description, @category, @location, @date, @status)`);
-const link = db.prepare("UPDATE items SET matched_with = ? WHERE id = ?");
+async function main() {
+  const db = await openDb(); // local file by default; hosted Turso when TURSO_DATABASE_URL is set
+  const insertSql = `
+    INSERT INTO items (type, title, description, category, location, date, status)
+    VALUES (@type, @title, @description, @category, @location, @date, @status)`;
 
-db.transaction(() => {
-  db.exec("DELETE FROM items; DELETE FROM sqlite_sequence WHERE name = 'items';");
-  const ids = {};
-  for (const it of ITEMS) {
-    ids[it.key] = insert.run({
-      type: it.type,
-      title: it.title,
-      description: it.description,
-      category: it.category,
-      location: it.location,
-      date: daysAgo(it.ago),
-      status: it.status || "Open",
-    }).lastInsertRowid;
-  }
-  for (const [a, b] of PAIRS) {
-    link.run(ids[b], ids[a]);
-    link.run(ids[a], ids[b]);
-  }
-})();
+  await db.transaction(async (tx) => {
+    await tx.run("DELETE FROM items");
+    await tx.run("DELETE FROM sqlite_sequence WHERE name = 'items'");
+    const ids = {};
+    for (const it of ITEMS) {
+      const info = await tx.run(insertSql, {
+        type: it.type,
+        title: it.title,
+        description: it.description,
+        category: it.category,
+        location: it.location,
+        date: daysAgo(it.ago),
+        status: it.status || "Open",
+      });
+      ids[it.key] = info.lastInsertRowid;
+    }
+    for (const [a, b] of PAIRS) {
+      await tx.run("UPDATE items SET matched_with = ? WHERE id = ?", [ids[b], ids[a]]);
+      await tx.run("UPDATE items SET matched_with = ? WHERE id = ?", [ids[a], ids[b]]);
+    }
+  });
 
-console.log(`Seeded ${ITEMS.length} items into the database.`);
+  console.log(`Seeded ${ITEMS.length} items into the ${db.kind} database.`);
+  db.close();
+}
+
+main().catch((err) => {
+  console.error("Seeding failed:", err.message);
+  process.exit(1);
+});

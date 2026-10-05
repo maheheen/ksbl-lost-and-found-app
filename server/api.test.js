@@ -1,7 +1,10 @@
-// End-to-end tests for the REST API, run against an in-memory database (your real data is untouched).
+// End-to-end tests for the REST API, run against a temporary database file (your real data is untouched).
 // They read the gap from MATCH_RULES, so they keep passing if you change maxDaysApart.
 const test = require("node:test");
 const assert = require("node:assert/strict");
+const os = require("node:os");
+const fs = require("node:fs");
+const path = require("node:path");
 const { openDb } = require("./db");
 const { createApp } = require("./app");
 const { MATCH_RULES } = require("./matching");
@@ -10,7 +13,9 @@ const { todayISO } = require("./validation");
 let server, base;
 
 test.before(async () => {
-  const app = createApp(openDb(":memory:"));
+  // A throw-away database file, so your real data is never touched.
+  const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "ksbl-api-")), "test.db");
+  const app = createApp(await openDb(file));
   await new Promise((resolve) => (server = app.listen(0, resolve)));
   base = `http://127.0.0.1:${server.address().port}`;
 });

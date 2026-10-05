@@ -4,3 +4,7 @@ server/lostfound.db
 server/lostfound.db-shm
 server/lostfound.db-wal
 .claude/
+.vercel/
+.env
+.env.*
+!.env.example

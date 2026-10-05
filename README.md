@@ -6,7 +6,7 @@ A web app where students, faculty and staff report items they have **lost** or *
 |---|---|
 | Frontend | React (Vite), Tailwind CSS v4, lucide-react icons, React Router |
 | Backend | Node.js + Express, REST API (JSON) |
-| Database | SQLite through `better-sqlite3`, stored in the file `server/lostfound.db` |
+| Database | SQLite through the libSQL client (`@libsql/client`): a local file `server/lostfound.db` by default, or a hosted Turso database (also SQLite) when deployed |
 | Auth | None (as specified) |
 
 <p align="center">
@@ -53,7 +53,7 @@ To start from scratch, stop the server and delete `server/lostfound.db*`.
 ### Troubleshooting
 
 * **Port already in use**: set another port (PowerShell: `$env:PORT=4000; npm start --prefix server`, bash: `PORT=4000 npm start --prefix server`) and update the proxy target in `client/vite.config.js`.
-* **`better-sqlite3` fails to install**: it normally downloads a prebuilt binary. If your Node version has none, install the "Desktop development with C++" build tools (Windows) or switch to an LTS version of Node.
+* **Install problems on Windows**: the database driver ships prebuilt binaries, so no compiler is needed. If an install fails with a "path too long" error, move the project to a shorter folder such as `C:\dev\ksbl-lost-and-found` (Windows limits paths to 260 characters).
 
 ---
 
@@ -70,9 +70,9 @@ server/
   app.js                 Every REST route, with comments
   matching.js            THE matching rule (the only place matching logic lives)
   matching.test.js       The 5 worked examples + extra checks
-  api.test.js            End-to-end API tests (in-memory database)
+  api.test.js            End-to-end API tests (temporary database file)
   validation.js          Server-side validation
-  db.js                  SQLite connection + automatic table creation
+  db.js                  SQLite connection (local file or Turso) + automatic table creation
   seed.js                Sample data
 ```
 
@@ -106,6 +106,7 @@ Base URL: `http://localhost:3001/api`. Errors are JSON, e.g. `{ "error": "Title 
 
 | Method | Path | Description | Success |
 |---|---|---|---|
+| GET | `/health` | *Extra.* Is the API up, and is it using the `local` file or the `hosted` database? | 200 |
 | GET | `/items` | List items (newest date first). Filters: `type`, `category`, `location`, `status`, `search` (title or description, case-insensitive), `dateFrom`, `dateTo` (inclusive). Filters combine with AND. | 200 |
 | GET | `/items/:id` | One item | 200 / 404 |
 | POST | `/items` | Create an item (all fields validated; `status` defaults to `Open`) | 201 / 400 |
@@ -291,3 +292,45 @@ Two families: **Bricolage Grotesque** for headings and the wordmark (a character
 * The Found item page lists the Lost reports that could be its owner ("Someone may be looking for this").
 * **Where each report lives (by status):** *Browse* lists only **Open** reports, so it never mixes with items that are already sorted out. When a pair is confirmed it moves to *Matches* (under "Ready to hand back"), and when it is marked returned it moves to the *Returned* tab. A report page highlights the tab its report belongs to, and its "Back" link goes there.
 * The `Matches` tab shows ready-to-hand-back pairs first, then lost reports with possible matches. The `Returned` tab shows each returned pair side by side.
+
+---
+
+## 8. Deploying to Vercel (with a hosted database)
+
+The repository is set up as a **Vercel project with two services** (`vercel.json`):
+
+| Service | Folder | Public path | Notes |
+|---|---|---|---|
+| `client` | `client/` | `/` (everything not under `/api`) | Vite build; falls back to `index.html` so links like `/items/3` work |
+| `server` | `server/` | `/api/*` | The Express API (`server/index.js`). Requests keep their full path, so the routes are unchanged |
+
+There are **no service-to-service calls**, so no bindings are needed: the browser calls `/api/...` on the same domain, and Vercel routes it to the server.
+
+**Why a hosted database.** Vercel functions have a read-only filesystem and no storage that is shared between requests, so a `lostfound.db` file cannot work there ([Vercel says SQLite can't be used on its platform](https://vercel.com/guides/is-sqlite-supported-in-vercel)). The app therefore talks to the database through the libSQL client, which opens **either** a local file (development, tests) **or** a hosted [Turso](https://turso.tech) database, which is SQLite in the cloud. The SQL is identical in both cases. The database is chosen by environment variables:
+
+| Variable | Meaning |
+|---|---|
+| `TURSO_DATABASE_URL` | e.g. `libsql://ksbl-lost-found-yourname.turso.io`. If unset, the local file `server/lostfound.db` is used |
+| `TURSO_AUTH_TOKEN` | the token for that database |
+
+(See `server/.env.example`. Never commit real values; `.env` files are git-ignored.)
+
+### Steps
+
+1. **Push the project to GitHub** (see the publishing steps in the project notes).
+2. **Create the database.** Sign up at turso.com, create a database (e.g. `ksbl-lost-found`), then copy its **URL** and create a **token** (dashboard, or `turso db show ksbl-lost-found --url` and `turso db tokens create ksbl-lost-found`).
+3. **Create the Vercel project.** On vercel.com choose **Add New, Project**, import the GitHub repo, and accept the detected **services** (`client`, `server`). Keep the repo root as the root directory.
+4. **Add the environment variables** `TURSO_DATABASE_URL` and `TURSO_AUTH_TOKEN` in **Settings, Environment Variables**, for Production (and Preview if you want previews to work), then deploy.
+5. **Add sample data once** (optional). From your computer, with the same two variables set, run the seed script. It **clears the items table first**, so only do this on a fresh database:
+
+   PowerShell:
+   ```powershell
+   $env:TURSO_DATABASE_URL="libsql://..."; $env:TURSO_AUTH_TOKEN="..."; npm run seed
+   ```
+   bash:
+   ```bash
+   TURSO_DATABASE_URL="libsql://..." TURSO_AUTH_TOKEN="..." npm run seed
+   ```
+6. **Check it.** Open `https://<your-project>.vercel.app/api/health`. You should see `{"ok":true,"database":"hosted","items":N}`. `"database":"local"` means the environment variables are missing; a 500 error means the URL or token is wrong (see the function logs in Vercel).
+
+Each report you add on the live site is stored in Turso, so it is still there on the next visit and shared by every visitor.

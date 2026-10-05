@@ -1,5 +1,6 @@
 // The Express app: every REST route lives here. createApp(db) is separate from
-// index.js so the automated API tests can run it against an in-memory database.
+// index.js so the automated API tests can run it against a temporary database.
+// `db` may be the helper from openDb() or a Promise of it - requests wait until it is ready.
 const path = require("path");
 const fs = require("fs");
 const express = require("express");
@@ -26,39 +27,61 @@ const toItem = (row) => ({
 const fail = (res, status, message, errors) =>
   res.status(status).json(errors ? { error: message, errors } : { error: message });
 
-function createApp(db) {
+// ---- SQL (always parameterized - user input never touches the SQL text) ----
+const SQL = {
+  byId: "SELECT * FROM items WHERE id = ?",
+  all: "SELECT * FROM items",
+  insert: `
+    INSERT INTO items (type, title, description, category, location, date, status)
+    VALUES (@type, @title, @description, @category, @location, @date, @status)`,
+  update: `
+    UPDATE items SET type=@type, title=@title, description=@description, category=@category,
+                     location=@location, date=@date, status=@status, matched_with=@matchedWith
+    WHERE id=@id`,
+  setStatusAndLink: "UPDATE items SET status = ?, matched_with = ? WHERE id = ?",
+  delete: "DELETE FROM items WHERE id = ?",
+};
+
+/** Parses ":id" from the URL. Returns null if it is not a positive whole number. */
+const parseId = (value) => (/^\d+$/.test(String(value)) && Number(value) > 0 ? Number(value) : null);
+
+/**
+ * If `row` is paired with another item, put the partner back to "Open" and
+ * clear its link. Used when a pair is broken (item edited, un-matched or deleted).
+ * Partners that are already "Returned" keep their status.
+ * `exec` is the database helper or an open transaction.
+ */
+async function releasePartner(exec, row) {
+  if (!row.matched_with) return;
+  const partner = await exec.get(SQL.byId, [row.matched_with]);
+  if (!partner) return;
+  const newStatus = partner.status === "Matched" ? "Open" : partner.status;
+  await exec.run(SQL.setStatusAndLink, [newStatus, null, partner.id]);
+}
+
+function createApp(dbOrPromise) {
   const app = express();
   app.use(cors());
   app.use(express.json({ limit: "100kb" }));
 
-  // ---- Prepared statements (always parameterized - user input never touches the SQL text) ----
-  const getById = db.prepare("SELECT * FROM items WHERE id = ?");
-  const getAll = db.prepare("SELECT * FROM items");
-  const insertItem = db.prepare(`
-    INSERT INTO items (type, title, description, category, location, date, status)
-    VALUES (@type, @title, @description, @category, @location, @date, @status)`);
-  const updateItem = db.prepare(`
-    UPDATE items SET type=@type, title=@title, description=@description, category=@category,
-                     location=@location, date=@date, status=@status, matched_with=@matchedWith
-    WHERE id=@id`);
-  const setStatusAndLink = db.prepare("UPDATE items SET status = ?, matched_with = ? WHERE id = ?");
-  const deleteItem = db.prepare("DELETE FROM items WHERE id = ?");
+  // Wait for the database connection once, then hand it to every route as `db`.
+  const ready = Promise.resolve(dbOrPromise);
+  app.use(async (req, res, next) => {
+    try {
+      req.db = await ready;
+      next();
+    } catch (err) {
+      next(err);
+    }
+  });
 
-  /** Parses ":id" from the URL. Returns null if it is not a positive whole number. */
-  const parseId = (value) => (/^\d+$/.test(String(value)) && Number(value) > 0 ? Number(value) : null);
-
-  /**
-   * If `row` is paired with another item, put the partner back to "Open" and
-   * clear its link. Used when a pair is broken (item edited, un-matched or deleted).
-   * Partners that are already "Returned" keep their status.
-   */
-  const releasePartner = (row) => {
-    if (!row.matched_with) return;
-    const partner = getById.get(row.matched_with);
-    if (!partner) return;
-    const newStatus = partner.status === "Matched" ? "Open" : partner.status;
-    setStatusAndLink.run(newStatus, null, partner.id);
-  };
+  // --------------------------------------------------------------------------
+  // GET /api/health  - is the API up, and which kind of database is it using?
+  // --------------------------------------------------------------------------
+  app.get("/api/health", async (req, res) => {
+    const { n } = await req.db.get("SELECT COUNT(*) AS n FROM items");
+    res.json({ ok: true, database: req.db.kind, items: n });
+  });
 
   // --------------------------------------------------------------------------
   // GET /api/items
@@ -67,7 +90,7 @@ function createApp(db) {
   //   search                            - case-insensitive text in title OR description
   //   dateFrom, dateTo                  - YYYY-MM-DD, inclusive range on the item date
   // --------------------------------------------------------------------------
-  app.get("/api/items", (req, res) => {
+  app.get("/api/items", async (req, res) => {
     const { type, category, location, status, search, dateFrom, dateTo } = req.query;
     const where = [];
     const params = [];
@@ -104,18 +127,18 @@ function createApp(db) {
 
     const sql = `SELECT * FROM items ${where.length ? "WHERE " + where.join(" AND ") : ""}
                  ORDER BY date DESC, id DESC`;
-    res.json(db.prepare(sql).all(...params).map(toItem));
+    res.json((await req.db.all(sql, params)).map(toItem));
   });
 
   // --------------------------------------------------------------------------
   // GET /api/matches
   // Overview for the Matches page: every Lost item that has at least one possible
   // match, or that is already paired. Result shape:
-  //   [{ lost, matches: [{ item, daysApart, reasons, conditions }], partner }]
+  //   { rules, groups: [{ lost, matches: [{ item, daysApart, reasons, ... }], partner }] }
   // (Registered before /api/items/:id so the two never clash.)
   // --------------------------------------------------------------------------
-  app.get("/api/matches", (req, res) => {
-    const all = getAll.all().map(toItem);
+  app.get("/api/matches", async (req, res) => {
+    const all = (await req.db.all(SQL.all)).map(toItem);
     const byId = new Map(all.map((i) => [i.id, i]));
     const groups = [];
     for (const lost of all) {
@@ -131,10 +154,10 @@ function createApp(db) {
   // --------------------------------------------------------------------------
   // GET /api/items/:id  - one item, or 404.
   // --------------------------------------------------------------------------
-  app.get("/api/items/:id", (req, res) => {
+  app.get("/api/items/:id", async (req, res) => {
     const id = parseId(req.params.id);
     if (!id) return fail(res, 400, "Item id must be a positive whole number");
-    const row = getById.get(id);
+    const row = await req.db.get(SQL.byId, [id]);
     if (!row) return fail(res, 404, "Item not found");
     res.json(toItem(row));
   });
@@ -142,12 +165,12 @@ function createApp(db) {
   // --------------------------------------------------------------------------
   // POST /api/items  - create an item. Validates every field; status defaults to "Open".
   // --------------------------------------------------------------------------
-  app.post("/api/items", (req, res) => {
+  app.post("/api/items", async (req, res) => {
     const { errors, value } = validateItem(req.body, { isCreate: true });
     const first = Object.values(errors)[0];
     if (first) return fail(res, 400, first, errors);
-    const info = insertItem.run(value);
-    res.status(201).json(toItem(getById.get(info.lastInsertRowid)));
+    const info = await req.db.run(SQL.insert, value);
+    res.status(201).json(toItem(await req.db.get(SQL.byId, [info.lastInsertRowid])));
   });
 
   // --------------------------------------------------------------------------
@@ -155,43 +178,42 @@ function createApp(db) {
   // If the item was paired and the edit breaks the pair (status back to "Open", or the
   // type/category/location/date changed) the partner is released back to "Open" too.
   // --------------------------------------------------------------------------
-  app.put("/api/items/:id", (req, res) => {
+  app.put("/api/items/:id", async (req, res) => {
     const id = parseId(req.params.id);
     if (!id) return fail(res, 400, "Item id must be a positive whole number");
-    const existing = getById.get(id);
+    const existing = await req.db.get(SQL.byId, [id]);
     if (!existing) return fail(res, 404, "Item not found");
 
     const { errors, value } = validateItem(req.body, { isCreate: false });
     const first = Object.values(errors)[0];
     if (first) return fail(res, 400, first, errors);
 
-    const save = db.transaction(() => {
+    await req.db.transaction(async (tx) => {
       let matchedWith = existing.matched_with;
       const matchFieldsChanged = ["type", "category", "location", "date"].some((k) => value[k] !== existing[k]);
       if (matchedWith && existing.status !== "Returned" && (value.status === "Open" || matchFieldsChanged)) {
-        releasePartner(existing);
+        await releasePartner(tx, existing);
         matchedWith = null;
         if (value.status === "Matched") value.status = "Open"; // a broken pair cannot stay "Matched"
       }
-      updateItem.run({ ...value, id, matchedWith });
+      await tx.run(SQL.update, { ...value, id, matchedWith });
     });
-    save();
-    res.json(toItem(getById.get(id)));
+    res.json(toItem(await req.db.get(SQL.byId, [id])));
   });
 
   // --------------------------------------------------------------------------
   // DELETE /api/items/:id  - delete an item. A paired partner goes back to "Open".
   // --------------------------------------------------------------------------
-  app.delete("/api/items/:id", (req, res) => {
+  app.delete("/api/items/:id", async (req, res) => {
     const id = parseId(req.params.id);
     if (!id) return fail(res, 400, "Item id must be a positive whole number");
-    const existing = getById.get(id);
+    const existing = await req.db.get(SQL.byId, [id]);
     if (!existing) return fail(res, 404, "Item not found");
 
-    db.transaction(() => {
-      if (existing.status !== "Returned") releasePartner(existing);
-      deleteItem.run(id);
-    })();
+    await req.db.transaction(async (tx) => {
+      if (existing.status !== "Returned") await releasePartner(tx, existing);
+      await tx.run(SQL.delete, [id]);
+    });
     res.json({ message: "Item deleted", id });
   });
 
@@ -199,18 +221,18 @@ function createApp(db) {
   // GET /api/items/:id/matches
   // Possible Found items for a LOST item (rules and sorting are in matching.js).
   // Calling it on a Found item is a 400. Response:
-  //   { item, rules, matches: [{ item, daysApart, reasons, conditions }] }
+  //   { item, rules, matches: [{ item, daysApart, reasons, sharedKeywords, conditions }] }
   // --------------------------------------------------------------------------
-  app.get("/api/items/:id/matches", (req, res) => {
+  app.get("/api/items/:id/matches", async (req, res) => {
     const id = parseId(req.params.id);
     if (!id) return fail(res, 400, "Item id must be a positive whole number");
-    const row = getById.get(id);
+    const row = await req.db.get(SQL.byId, [id]);
     if (!row) return fail(res, 404, "Item not found");
     if (row.type !== "Lost") {
       return fail(res, 400, "Matches can only be requested for a Lost item. Open the matching Lost report instead.");
     }
     const lost = toItem(row);
-    const matches = findMatches(lost, getAll.all().map(toItem));
+    const matches = findMatches(lost, (await req.db.all(SQL.all)).map(toItem));
     res.json({ item: lost, rules: MATCH_RULES, matches });
   });
 
@@ -219,14 +241,14 @@ function createApp(db) {
   // Pairs a Lost item (:id) with a Found item. Both must be "Open" and must really be a
   // possible match under the current rules. Both become "Matched" and point at each other.
   // --------------------------------------------------------------------------
-  app.post("/api/items/:id/confirm-match", (req, res) => {
+  app.post("/api/items/:id/confirm-match", async (req, res) => {
     const lostId = parseId(req.params.id);
     if (!lostId) return fail(res, 400, "Item id must be a positive whole number");
     const foundId = parseId(req.body && req.body.foundId);
     if (!foundId) return fail(res, 400, "foundId is required and must be a positive whole number");
 
-    const lostRow = getById.get(lostId);
-    const foundRow = getById.get(foundId);
+    const lostRow = await req.db.get(SQL.byId, [lostId]);
+    const foundRow = await req.db.get(SQL.byId, [foundId]);
     if (!lostRow) return fail(res, 404, "Lost item not found");
     if (!foundRow) return fail(res, 404, "Found item not found");
     if (lostRow.type !== "Lost") return fail(res, 400, "The item you are matching must be a Lost report");
@@ -237,11 +259,14 @@ function createApp(db) {
       return fail(res, 400, "These two items are not a possible match");
     }
 
-    db.transaction(() => {
-      setStatusAndLink.run("Matched", foundId, lostId);
-      setStatusAndLink.run("Matched", lostId, foundId);
-    })();
-    res.json({ lost: toItem(getById.get(lostId)), found: toItem(getById.get(foundId)) });
+    await req.db.transaction(async (tx) => {
+      await tx.run(SQL.setStatusAndLink, ["Matched", foundId, lostId]);
+      await tx.run(SQL.setStatusAndLink, ["Matched", lostId, foundId]);
+    });
+    res.json({
+      lost: toItem(await req.db.get(SQL.byId, [lostId])),
+      found: toItem(await req.db.get(SQL.byId, [foundId])),
+    });
   });
 
   // --------------------------------------------------------------------------
@@ -249,26 +274,28 @@ function createApp(db) {
   // The owner has their item back. Only "Matched" items can be returned.
   // The item and its partner (if any) both become "Returned".
   // --------------------------------------------------------------------------
-  app.post("/api/items/:id/mark-returned", (req, res) => {
+  app.post("/api/items/:id/mark-returned", async (req, res) => {
     const id = parseId(req.params.id);
     if (!id) return fail(res, 400, "Item id must be a positive whole number");
-    const row = getById.get(id);
+    const row = await req.db.get(SQL.byId, [id]);
     if (!row) return fail(res, 404, "Item not found");
     if (row.status !== "Matched") return fail(res, 409, "Only matched items can be marked as returned");
 
-    db.transaction(() => {
-      setStatusAndLink.run("Returned", row.matched_with, id);
-      if (row.matched_with && getById.get(row.matched_with)) {
-        setStatusAndLink.run("Returned", id, row.matched_with);
+    await req.db.transaction(async (tx) => {
+      await tx.run(SQL.setStatusAndLink, ["Returned", row.matched_with, id]);
+      if (row.matched_with && (await tx.get(SQL.byId, [row.matched_with]))) {
+        await tx.run(SQL.setStatusAndLink, ["Returned", id, row.matched_with]);
       }
-    })();
+    });
+    const partnerRow = row.matched_with ? await req.db.get(SQL.byId, [row.matched_with]) : null;
     res.json({
-      item: toItem(getById.get(id)),
-      partner: row.matched_with ? toItem(getById.get(row.matched_with)) : null,
+      item: toItem(await req.db.get(SQL.byId, [id])),
+      partner: partnerRow ? toItem(partnerRow) : null,
     });
   });
 
-  // ---- Optional: serve the built React app (after `npm run build` in /client) ----
+  // ---- Optional: serve the built React app (after `npm run build` in /client) when running
+  // as a single local server. On Vercel the client is its own service, so this does not apply. ----
   const dist = path.join(__dirname, "..", "client", "dist");
   if (fs.existsSync(dist)) {
     app.use(express.static(dist));
@@ -279,6 +306,7 @@ function createApp(db) {
   app.use("/api", (req, res) => fail(res, 404, "Route not found"));
 
   // Last-resort error handler: bad JSON is the client's fault (400), anything else is ours (500).
+  // (Express 5 sends errors from async routes here automatically.)
   // eslint-disable-next-line no-unused-vars
   app.use((err, req, res, next) => {
     if (err.type === "entity.parse.failed") return fail(res, 400, "Request body is not valid JSON");
